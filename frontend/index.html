@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="UTF-8" />
+  <title>DevOps Lab 01</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 640px; margin: 4rem auto; padding: 0 1rem; }
+    #status { padding: 0.75rem 1rem; border-radius: 6px; background: #f0f0f0; font-family: monospace; }
+  </style>
+</head>
+<body>
+  <h1>DevOps Lab 01</h1>
+  <p>Statische Seite, ausgeliefert von nginx. Der Status darunter kommt live vom Backend (Reverse Proxy unter <code>/api/</code>).</p>
+  <div id="status">lade Status…</div>
+
+  <script>
+    fetch("/api/status")
+      .then((res) => res.json())
+      .then((data) => {
+        document.getElementById("status").textContent = JSON.stringify(data, null, 2);
+      })
+      .catch((err) => {
+        document.getElementById("status").textContent = "Backend nicht erreichbar: " + err;
+      });
+  </script>
+</body>
+</html>

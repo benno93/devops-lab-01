@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: Test (Backend)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Code auschecken
+        uses: actions/checkout@v4
+
+      - name: Python einrichten
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Abhaengigkeiten installieren
+        working-directory: backend
+        run: pip install -r requirements-dev.txt
+
+      - name: Tests ausfuehren
+        working-directory: backend
+        run: pytest -v
+
+  build-and-push:
+    name: Build & Push Images (ghcr.io)
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Code auschecken
+        uses: actions/checkout@v4
+
+      - name: Bei GitHub Container Registry anmelden
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Backend-Image bauen und pushen
+        uses: docker/build-push-action@v6
+        with:
+          context: ./backend
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/devops-lab-01-backend:latest
+            ghcr.io/${{ github.repository_owner }}/devops-lab-01-backend:${{ github.sha }}
+
+      - name: Frontend-Image bauen und pushen
+        uses: docker/build-push-action@v6
+        with:
+          context: ./frontend
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/devops-lab-01-frontend:latest
+            ghcr.io/${{ github.repository_owner }}/devops-lab-01-frontend:${{ github.sha }}

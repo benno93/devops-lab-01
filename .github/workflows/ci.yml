@@ -1,43 +1,108 @@
+# ============================================================
+# CI-Pipeline fuer devops-lab-01
+# Muss unter .github/workflows/ci.yml liegen - GitHub Actions
+# durchsucht diesen Ordner automatisch nach Workflow-Dateien.
+# ============================================================
+
 name: CI
+# Freier Anzeigename der Pipeline. Erscheint so im "Actions"-Tab
+# und in der Historie jedes einzelnen Laufs.
 
 on:
+  # "on" legt fest, WELCHES Ereignis diesen Workflow ueberhaupt startet -
+  # das entspricht der in Kap. 2.3 geforderten Anforderung "automatisierte
+  # Ausloeser" (Push, Merge, Tag, manueller Trigger).
   push:
     branches: [main]
+    # Startet den Workflow bei jedem Push auf den Branch "main".
+    # Weil in 3.4 GitHub Flow gewaehlt wurde, ist "main" der einzige
+    # dauerhafte Branch - jeder Merge eines Feature-Branches landet hier
+    # und loest automatisch Build, Test und Image-Push aus.
   pull_request:
     branches: [main]
+    # Startet den Workflow zusaetzlich bei jedem Pull Request GEGEN main,
+    # noch VOR dem Merge. Das ist die Pruefung waehrend der "Dev"-Phase
+    # aus dem Erweiterungs-Abschnitt weiter unten: Code wird getestet,
+    # bevor er ueberhaupt gemergt wird.
 
 jobs:
+  # Ein Workflow besteht aus einem oder mehreren "jobs". Jeder Job laeuft
+  # in einer eigenen, frisch gestarteten virtuellen Maschine (VM) - Jobs
+  # teilen sich standardmaessig KEINEN Dateisystem-Zustand miteinander.
+
   test:
     name: Test (Backend)
-    runs-on: ubuntu-latest
+    # Anzeigename dieses einzelnen Jobs im Actions-Tab.
+    runs-on: self-hosted
+    # Legt das Betriebssystem/Image fest, auf dem der Job laeuft.
+    # "self-hosted" ist der kostenlose Standard-Runner von GitHub
+    # (siehe Kap. 3.2, Kriterium "Kosten").
     steps:
+      # Ein Job besteht aus einer Abfolge von "steps". Jeder Step bekommt hier
+      # zusaetzlich ein eigenes "name:" - ohne das wuerde GitHub im Actions-Tab
+      # nur die rohe uses/run-Zeile anzeigen statt eines sprechenden Namens
+      # (vergleiche die Screenshots weiter oben: "Code auschecken", "Tests
+      # ausfuehren" usw. kommen genau von diesen "name:"-Feldern).
+
       - name: Code auschecken
         uses: actions/checkout@v4
+        # "uses" bindet eine vorgefertigte, wiederverwendbare Action ein
+        # (hier von GitHub selbst gepflegt). Diese eine Zeile laedt den
+        # Code deines Repos in die VM - ohne sie waere die VM leer und
+        # es gaebe nichts zu testen.
 
       - name: Python einrichten
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+        # Installiert die angegebene Python-Version in der VM.
+        # "with" uebergibt Parameter an die Action, hier die gewuenschte
+        # Version - sollte zu der passen, mit der du lokal entwickelst.
 
       - name: Abhaengigkeiten installieren
         working-directory: backend
         run: pip install -r requirements-dev.txt
+        # "run" fuehrt einen beliebigen Shell-Befehl aus (statt einer
+        # fertigen Action). "working-directory" wechselt vorher in den
+        # Ordner "backend", damit pip die richtige Datei findet.
+        # requirements-dev.txt zieht Flask UND zusaetzlich pytest.
 
       - name: Tests ausfuehren
         working-directory: backend
         run: pytest -v
+        # Fuehrt die Tests aus backend/tests/test_app.py aus.
+        # Schlaegt ein Test fehl, bricht dieser Schritt (und damit der
+        # ganze Job) mit einem Fehler ab. Genau DAS verhindert aktuell
+        # nichts im Ist-Zustand aus Kap. 2.2 - fehlerhafter Code koennte
+        # dort ungeprueft bis in die Produktion gelangen. Ab hier nicht mehr.
 
   build-and-push:
     name: Build & Push Images (ghcr.io)
     needs: test
+    # "needs" erzwingt eine Reihenfolge: dieser Job startet erst, NACHDEM
+    # der Job "test" erfolgreich (gruen) durchgelaufen ist. Schlaegt "test"
+    # fehl, wird "build-and-push" gar nicht erst gestartet - so werden nie
+    # ungetestete Images gebaut oder veroeffentlicht.
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
+    # Zusaetzliche Bedingung: Dieser Job laeuft NUR bei einem echten Push
+    # auf main, nicht bei einem Pull Request. Sinn: ein PR soll nur
+    # getestet werden (Job "test"); Images bauen und veroeffentlichen soll
+    # erst passieren, wenn der Code tatsaechlich in main gelandet ist -
+    # sonst wuerden schon offene PRs ungeprueften Code in die Registry
+    # schieben koennen.
+    runs-on: self-hosted
     permissions:
       contents: read
       packages: write
+      # Der von GitHub automatisch erzeugte GITHUB_TOKEN (siehe unten) hat
+      # standardmaessig KEIN Schreibrecht auf die Container Registry.
+      # "packages: write" schaltet genau das frei - ohne diese Zeile
+      # wuerde der Login/Push im naechsten Schritt mit "denied" fehlschlagen.
     steps:
       - name: Code auschecken
         uses: actions/checkout@v4
+        # Auch dieser Job startet in einer LEEREN, frischen VM - der Code
+        # muss daher hier erneut ausgecheckt werden.
 
       - name: Bei GitHub Container Registry anmelden
         uses: docker/login-action@v3
@@ -45,21 +110,36 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+        # Meldet Docker in dieser VM bei ghcr.io an.
+        # "${{ github.actor }}" ist eine eingebaute Variable: der GitHub-
+        # Benutzername, der den Lauf ausgeloest hat.
+        # "secrets.GITHUB_TOKEN" ist KEIN von dir angelegtes Geheimnis,
+        # sondern ein Token, das GitHub fuer JEDEN Workflow-Lauf automatisch
+        # neu erzeugt und danach wieder ungueltig macht - genau der Vorteil
+        # aus Kap. 3.3: kein separates Konto, keine eigenen Zugangsdaten.
 
       - name: Backend-Image bauen und pushen
         uses: docker/build-push-action@v6
         with:
           context: ./backend
+          # "context" ist der Ordner, der als Docker-Build-Kontext dient -
+          # hier muss backend/Dockerfile liegen.
           push: true
-          tags: |
-            ghcr.io/${{ github.repository_owner }}/devops-lab-01-backend:latest
-            ghcr.io/${{ github.repository_owner }}/devops-lab-01-backend:${{ github.sha }}
+          # Baut das Image nicht nur lokal in der VM, sondern laedt es
+          # danach auch direkt zu ghcr.io hoch.
+          tags: ghcr.io/${{ github.repository_owner }}/devops-lab-01-backend:${{ github.sha }}
+          # Der Tag bestimmt den vollen Namen inkl. Version, unter dem das
+          # Image spaeter in der Registry auffindbar ist.
+          # "github.repository_owner" = dein GitHub-Benutzername.
+          # "github.sha" = der volle Commit-Hash dieses Laufs - so bekommt
+          # JEDER Commit sein eigenes, eindeutiges Image, statt sich
+          # gegenseitig zu ueberschreiben wie bei einem festen "latest".
 
       - name: Frontend-Image bauen und pushen
         uses: docker/build-push-action@v6
         with:
           context: ./frontend
           push: true
-          tags: |
-            ghcr.io/${{ github.repository_owner }}/devops-lab-01-frontend:latest
-            ghcr.io/${{ github.repository_owner }}/devops-lab-01-frontend:${{ github.sha }}
+          tags: ghcr.io/${{ github.repository_owner }}/devops-lab-01-frontend:${{ github.sha }}
+        # Identischer Ablauf wie eben, nur fuer das Frontend-Image
+        # (Dockerfile liegt in frontend/Dockerfile).

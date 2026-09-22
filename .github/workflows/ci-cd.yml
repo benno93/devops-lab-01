@@ -1,10 +1,12 @@
 # ============================================================
-# CI-Pipeline fuer devops-lab-01
-# Muss unter .github/workflows/ci.yml liegen - GitHub Actions
-# durchsucht diesen Ordner automatisch nach Workflow-Dateien.
+# CI/CD-Pipeline fuer devops-lab-01
+# Muss unter .github/workflows/ liegen - GitHub Actions durchsucht
+# diesen Ordner automatisch nach Workflow-Dateien.
+# Ablauf:  Test -> Build & Push -> Deploy Staging -> Deploy Production
+#          (Production erst nach manueller Freigabe, siehe Environment)
 # ============================================================
 
-name: CI
+name: CI/CD Pipeline
 # Freier Anzeigename der Pipeline. Erscheint so im "Actions"-Tab
 # und in der Historie jedes einzelnen Laufs.
 
@@ -18,6 +20,9 @@ on:
     # Weil in 3.4 GitHub Flow gewaehlt wurde, ist "main" der einzige
     # dauerhafte Branch - jeder Merge eines Feature-Branches landet hier
     # und loest automatisch Build, Test und Image-Push aus.
+  workflow_dispatch:
+    # Manueller Trigger ueber den Actions-Tab (Kap. 2.3): startet die komplette
+    # Pipeline fuer den gewaehlten Branch, Deployment aber nur auf main.
   pull_request:
     branches: [main]
     # Startet den Workflow zusaetzlich bei jedem Pull Request GEGEN main,
@@ -35,8 +40,9 @@ jobs:
     # Anzeigename dieses einzelnen Jobs im Actions-Tab.
     runs-on: self-hosted
     # Legt das Betriebssystem/Image fest, auf dem der Job laeuft.
-    # "self-hosted" ist der kostenlose Standard-Runner von GitHub
-    # (siehe Kap. 3.2, Kriterium "Kosten").
+    # "self-hosted" waehlt den eigenen, lokal betriebenen Runner statt eines
+    # von GitHub bereitgestellten Runners (z. B. "ubuntu-latest"). Er hat
+    # Zugriff auf den lokalen Cluster, den die Deploy-Jobs per kubectl ansprechen.
     steps:
       # Ein Job besteht aus einer Abfolge von "steps". Jeder Step bekommt hier
       # zusaetzlich ein eigenes "name:" - ohne das wuerde GitHub im Actions-Tab
@@ -76,14 +82,14 @@ jobs:
         # nichts im Ist-Zustand aus Kap. 2.2 - fehlerhafter Code koennte
         # dort ungeprueft bis in die Produktion gelangen. Ab hier nicht mehr.
 
-  build-and-push:
-    name: Build & Push Images (ghcr.io)
+  build:
+    name: Build & Push (ghcr.io)
     needs: test
     # "needs" erzwingt eine Reihenfolge: dieser Job startet erst, NACHDEM
     # der Job "test" erfolgreich (gruen) durchgelaufen ist. Schlaegt "test"
-    # fehl, wird "build-and-push" gar nicht erst gestartet - so werden nie
+    # fehl, wird "build" gar nicht erst gestartet - so werden nie
     # ungetestete Images gebaut oder veroeffentlicht.
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     # Zusaetzliche Bedingung: Dieser Job laeuft NUR bei einem echten Push
     # auf main, nicht bei einem Pull Request. Sinn: ein PR soll nur
     # getestet werden (Job "test"); Images bauen und veroeffentlichen soll
@@ -143,3 +149,49 @@ jobs:
           tags: ghcr.io/${{ github.repository_owner }}/devops-lab-01-frontend:${{ github.sha }}
         # Identischer Ablauf wie eben, nur fuer das Frontend-Image
         # (Dockerfile liegt in frontend/Dockerfile).
+
+  deploy-staging:
+    name: Deploy Staging (kubectl)
+    needs: build
+    # Startet erst, wenn die Images fuer diesen Commit in ghcr.io liegen.
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: self-hosted
+    environment: staging
+    # GitHub-Environment "staging": macht Deployments im Repo sichtbar und
+    # erlaubt umgebungsspezifische Regeln, hier ohne Freigabe.
+    concurrency:
+      group: deploy-staging
+      cancel-in-progress: false
+      # Nie zwei Deployments gleichzeitig in dieselbe Umgebung; ein laufendes
+      # Deployment wird nicht abgebrochen, sondern das naechste wartet.
+    steps:
+      - name: Code auschecken
+        uses: actions/checkout@v4
+        # Die Kubernetes-Manifeste (k8s/) und deploy.sh liegen im Repo.
+
+      - name: Nach Staging deployen
+        run: k8s/deploy.sh staging "${{ github.sha }}" "${{ github.repository_owner }}"
+        # Wendet die Manifeste per kubectl an, wartet auf den Rollout,
+        # fuehrt einen Smoke-Test aus und rollt bei Fehlern automatisch zurueck.
+        # kubectl nutzt die Kubeconfig des Runner-Benutzers - keine
+        # Cluster-Zugangsdaten als Secret noetig.
+
+  deploy-production:
+    name: Deploy Production (kubectl)
+    needs: deploy-staging
+    # Production wird nur ausgerollt, wenn Staging erfolgreich war.
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: self-hosted
+    environment: production
+    # Im Environment "production" sind unter Settings > Environments die
+    # "Required reviewers" hinterlegt: Der Job pausiert, bis eine Person die
+    # Produktivsetzung freigibt (Freigabeschritt aus Kap. 2.3).
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
+    steps:
+      - name: Code auschecken
+        uses: actions/checkout@v4
+
+      - name: Nach Production deployen
+        run: k8s/deploy.sh production "${{ github.sha }}" "${{ github.repository_owner }}"

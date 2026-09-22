@@ -1,0 +1,70 @@
+# Frontend (nginx) - Deployment + Service.
+# Struktur identisch zu backend.yaml, siehe dort fuer die ausfuehrlichen
+# Erklaerungen zu Deployment/Service/Probes/Resources - hier nur die Stellen,
+# die beim Frontend anders sind.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+  labels: { app: frontend }
+spec:
+  replicas: 2   # Auch hier 2 Pods fuer Ausfallsicherheit und ausfallfreies Update.
+  selector:
+    matchLabels: { app: frontend }
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0   # Wie beim Backend: nie weniger verfuegbare Pods als replicas.
+      maxSurge: 1
+  template:
+    metadata:
+      labels: { app: frontend }
+    spec:
+      # Nur noetig, wenn das ghcr.io-Image privat ist (siehe backend.yaml).
+      imagePullSecrets:
+        - name: ghcr-pull
+      containers:
+        - name: frontend
+          # __REGISTRY__/__TAG__ werden von deploy.sh ersetzt - siehe backend.yaml.
+          image: __REGISTRY__/devops-lab-01-frontend:__TAG__
+          ports:
+            - containerPort: 80
+            # Port 80: nginx im Container lauscht dort (siehe frontend/Dockerfile
+            # bzw. frontend/nginx.conf, "listen 80;").
+          readinessProbe:
+            # Frontend hat keinen eigenen /health-Endpoint wie das Backend -
+            # die Startseite "/" reicht: Antwortet nginx dort, laeuft der
+            # Webserver und die statische Datei index.html ist vorhanden.
+            httpGet: { path: /, port: 80 }
+            initialDelaySeconds: 2   # nginx startet sehr schnell -> kuerzere Wartezeit als beim Backend.
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /, port: 80 }
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            # Niedriger angesetzt als beim Backend: nginx liefert hier nur eine
+            # einzelne statische HTML-Datei aus und proxied API-Aufrufe weiter,
+            # das braucht deutlich weniger CPU/RAM als der Python-Prozess.
+            requests: { cpu: 25m, memory: 32Mi }
+            limits: { cpu: 200m, memory: 64Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend
+  # Anders als beim Backend-Service muss dieser Name nicht exakt "frontend"
+  # heissen (kein anderer Cluster-interner Client greift fest darauf zu) -
+  # relevant ist er nur fuer den Smoke-Test in deploy.sh
+  # (http://frontend/api/health) und fuer den Zugriff von aussen.
+  labels: { app: frontend }
+spec:
+  type: ClusterIP
+  # Auch von aussen wird ueber ClusterIP zugegriffen, z. B. per
+  # "kubectl port-forward" oder einen vorgeschalteten Ingress/LoadBalancer
+  # (in diesem Lab noch nicht eingerichtet) - fuer den Smoke-Test innerhalb
+  # des Clusters reicht ClusterIP bereits aus.
+  selector: { app: frontend }
+  ports:
+    - port: 80
+      targetPort: 80

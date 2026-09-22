@@ -1,0 +1,110 @@
+# Backend (Flask) - Deployment + Service.
+# Platzhalter __REGISTRY__ und __TAG__ ersetzt deploy.sh per sed vor dem
+# Anwenden, damit jeder Commit (Tag = Commit-SHA) genau sein eigenes,
+# in der CI gebautes Image ausrollt - nie "latest".
+apiVersion: apps/v1
+kind: Deployment   # "Deployment" statt einzelner Pods: kuemmert sich selbst um
+                    # Neustarts, Rolling Updates und die gewuenschte Anzahl Pods.
+metadata:
+  name: backend               # Name des Deployments (fuer kubectl-Befehle, z. B. rollout status).
+  labels: { app: backend }    # Frei waehlbares Label am Deployment-Objekt selbst (nicht an den Pods!).
+spec:
+  replicas: 2   # Anzahl paralleler Backend-Pods. 2 statt 1, damit beim Rolling
+                # Update oder einem Node-Ausfall immer mindestens ein Pod laeuft.
+  selector:
+    # Legt fest, welche Pods zu DIESEM Deployment gehoeren - anhand des Labels
+    # weiter unten (template.metadata.labels). Muss exakt dazu passen, sonst
+    # "verliert" das Deployment seine eigenen Pods.
+    matchLabels: { app: backend }
+  strategy:
+    type: RollingUpdate   # Pods werden nacheinander ausgetauscht statt alle auf
+                           # einmal (Alternative waere "Recreate": kurzer Totalausfall).
+    rollingUpdate:
+      maxUnavailable: 0   # Waehrend des Updates darf die Zahl VERFUEGBARER Pods nie
+                           # unter "replicas" fallen -> alte Pods werden erst abgebaut,
+                           # wenn genuegend neue Pods bereit (ready) sind -> kein Ausfall.
+      maxSurge: 1          # Erlaubt zusaetzlich EINEN Pod ueber "replicas" hinaus
+                            # waehrend des Updates, damit ueberhaupt Platz fuer den
+                            # neuen Pod ist, bevor ein alter abgebaut wird.
+  template:
+    # Die "Schablone", nach der Kubernetes die eigentlichen Pods erstellt.
+    metadata:
+      labels: { app: backend }   # Dieses Label bekommt jeder erzeugte Pod - muss zum
+                                  # "selector" oben UND zum Service weiter unten passen.
+    spec:
+      # Nur noetig, wenn das ghcr.io-Image PRIVAT ist: Ohne dieses Secret kann
+      # der Cluster das Image nicht herunterladen ("ImagePullBackOff"). Muss
+      # einmalig pro Namespace angelegt werden (siehe README/CD-Doku), hier
+      # wird nur der Name referenziert.
+      imagePullSecrets:
+        - name: ghcr-pull
+      containers:
+        - name: backend
+          # __REGISTRY__ -> z. B. ghcr.io/<dein-github-name>
+          # __TAG__      -> Commit-SHA, ersetzt deploy.sh vor dem Apply.
+          image: __REGISTRY__/devops-lab-01-backend:__TAG__
+          ports:
+            - containerPort: 5001   # Port, auf dem app.py im Container lauscht
+                                     # (siehe PORT-Env in backend/Dockerfile). Rein
+                                     # informativ fuer Kubernetes/Menschen, oeffnet
+                                     # selbst noch nichts nach aussen.
+          env:
+            - name: APP_VERSION
+              value: "__TAG__"
+              # Wird von app.py in /api/status zurueckgegeben -> im laufenden
+              # Cluster ist so jederzeit nachvollziehbar, welcher Commit gerade
+              # tatsaechlich deployed ist (Abgleich mit der Staging-Pruefung
+              # in der Pipeline).
+          readinessProbe:
+            # Entscheidet, ob EIN Pod bereits Traffic ueber den Service
+            # bekommen soll. Erst wenn diese Probe gruen ist, gilt der Pod
+            # im Rolling Update als "bereit" (siehe maxUnavailable: 0 oben).
+            httpGet: { path: /api/health, port: 5001 }
+            initialDelaySeconds: 3   # Wartezeit nach Container-Start, bevor ueberhaupt geprueft wird.
+            periodSeconds: 5         # Danach alle 5s erneut pruefen.
+          livenessProbe:
+            # Entscheidet, ob der Container noch "lebt". Schlaegt diese Probe
+            # dauerhaft fehl, startet Kubernetes den Container automatisch neu -
+            # unabhaengig davon, ob er schon Traffic bekommt oder nicht.
+            httpGet: { path: /api/health, port: 5001 }
+            initialDelaySeconds: 10   # Etwas laenger als readiness, damit ein
+                                       # normal langsamer Start nicht sofort als
+                                       # "tot" gewertet und neu gestartet wird.
+            periodSeconds: 10
+          resources:
+            # Ohne Angaben koennte ein einzelner Pod theoretisch den ganzen
+            # Node auffressen oder umgekehrt zu wenig bekommen.
+            requests: { cpu: 50m, memory: 64Mi }
+            # "requests": das MINIMUM, das dem Pod fest reserviert wird -
+            # Kubernetes plant den Pod nur auf einem Node ein, der das hergibt.
+            # 50m = 0,05 CPU-Kerne (m = Millicpu).
+            limits: { cpu: 250m, memory: 128Mi }
+            # "limits": die OBERGRENZE. Bei CPU wird der Pod dort nur gedrosselt,
+            # bei Memory wird er beim Ueberschreiten vom Node-Kernel beendet und
+            # von Kubernetes neu gestartet (OOMKilled).
+---
+# Zweites Objekt in derselben Datei, getrennt durch "---".
+apiVersion: v1
+kind: Service
+# Ein "Service" gibt den (wechselnden) Backend-Pods eine stabile interne
+# Adresse. Ohne Service muessten andere Komponenten einzelne, sich staendig
+# aendernde Pod-IPs kennen.
+metadata:
+  name: backend
+  # WICHTIG: Der Name muss exakt "backend" bleiben, denn frontend/nginx.conf
+  # proxied fest auf "http://backend:5001" - dieser Servicename ist der
+  # DNS-Name, unter dem nginx das Backend innerhalb des Clusters findet.
+  labels: { app: backend }
+spec:
+  type: ClusterIP
+  # ClusterIP = nur INNERHALB des Clusters erreichbar (nicht von aussen).
+  # Passt hier, weil nur das Frontend (ebenfalls im Cluster) das Backend
+  # direkt anspricht - von aussen geht der Weg ueber das Frontend/nginx.
+  selector: { app: backend }
+  # Der Service leitet Traffic an ALLE Pods weiter, deren Labels hierzu
+  # passen - das sind genau die vom Deployment oben erzeugten Backend-Pods.
+  ports:
+    - port: 5001         # Port, unter dem der SERVICE selbst erreichbar ist
+                          # (das spricht nginx an: backend:5001).
+      targetPort: 5001   # Port, an den intern zum jeweiligen POD weitergeleitet
+                          # wird - muss zu containerPort oben passen.

@@ -59,7 +59,7 @@ metadata:
   # (http://frontend/api/health) und fuer den Zugriff von aussen.
   labels: { app: frontend }
 spec:
-  type: ClusterIP
+  type: NodePort
   # Auch von aussen wird ueber ClusterIP zugegriffen, z. B. per
   # "kubectl port-forward" oder einen vorgeschalteten Ingress/LoadBalancer
   # (in diesem Lab noch nicht eingerichtet) - fuer den Smoke-Test innerhalb
@@ -68,3 +68,4 @@ spec:
   ports:
     - port: 80
       targetPort: 80
+      nodePort: __NODEPORT__

@@ -38,6 +38,26 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 # heraus es aufgerufen wird (wichtig, weil die Pipeline und ein lokaler
 # Aufruf typischerweise aus unterschiedlichen Arbeitsverzeichnissen laufen).
 
+case "$NAMESPACE" in
+  staging)    NODEPORT=30080 ;;
+  production) NODEPORT=30081 ;;
+  *)
+    echo "::error::Kein NodePort fuer Namespace '${NAMESPACE}' definiert (nur staging/production vorgesehen)."
+    exit 1
+    ;;
+esac
+# NodePort ist - anders als der Namespace - CLUSTERWEIT eindeutig, nicht pro
+# Namespace: derselbe Wert darf nur EINMAL im gesamten Cluster vergeben sein.
+# Wuerde man in frontend.yaml einen festen nodePort eintragen, wuerde das
+# identische Manifest beim zweiten "apply" (in einem ANDEREN Namespace,
+# z. B. production nach staging) mit einem Fehler abgelehnt, weil der Port
+# schon vom ersten Namespace belegt ist. Deshalb bekommt hier jeder erlaubte
+# Namespace explizit seinen EIGENEN, festen Port zugewiesen und wird unten
+# wie __REGISTRY__/__TAG__ per sed in frontend.yaml eingesetzt - staging und
+# production sind damit dauerhaft unter unterschiedlichen, vorhersehbaren
+# URLs erreichbar (http://<VM>:30080 bzw. :30081), unabhaengig von einem
+# offenen kubectl-port-forward-Terminal.
+
 TIMEOUT="120s"
 # Wie lange maximal auf einen erfolgreichen Rollout gewartet wird, bevor
 # Schritt 3 unten als fehlgeschlagen gilt und der Rollback greift.
@@ -77,16 +97,18 @@ kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -
 # Hostnamen "backend" auf - existiert der Backend-Service zu dem Zeitpunkt
 # schon, klappt das zuverlaessiger.)
 for f in backend frontend; do
-  sed -e "s|__REGISTRY__|${REGISTRY}|g" -e "s|__TAG__|${SHA}|g" "$DIR/$f.yaml" \
+  sed -e "s|__REGISTRY__|${REGISTRY}|g" -e "s|__TAG__|${SHA}|g" -e "s|__NODEPORT__|${NODEPORT}|g" "$DIR/$f.yaml" \
     | kubectl -n "$NAMESPACE" apply -f -
-  # sed ersetzt in backend.yaml/frontend.yaml die Platzhalter __REGISTRY__
-  # und __TAG__ durch die tatsaechlichen Werte und gibt das Ergebnis auf
-  # stdout aus (die Dateien selbst werden NICHT veraendert). Das Ergebnis
-  # wird direkt per Pipe an "kubectl apply -f -" uebergeben ("-f -" heisst:
-  # Manifest von stdin lesen statt aus einer Datei) - so landet nirgends
-  # eine Zwischendatei mit dem konkreten Image-Tag auf der Platte.
-  # "-n $NAMESPACE" wendet das Manifest im richtigen Namespace an (statt im
-  # Namespace "default").
+  # sed ersetzt in backend.yaml/frontend.yaml die Platzhalter __REGISTRY__,
+  # __TAG__ und (nur in frontend.yaml vorhanden, in backend.yaml kommt der
+  # String einfach nicht vor und die Ersetzung greift dort ins Leere) den
+  # oben festgelegten __NODEPORT__ durch die tatsaechlichen Werte und gibt
+  # das Ergebnis auf stdout aus (die Dateien selbst werden NICHT veraendert).
+  # Das Ergebnis wird direkt per Pipe an "kubectl apply -f -" uebergeben
+  # ("-f -" heisst: Manifest von stdin lesen statt aus einer Datei) - so
+  # landet nirgends eine Zwischendatei mit den konkreten Werten auf der
+  # Platte. "-n $NAMESPACE" wendet das Manifest im richtigen Namespace an
+  # (statt im Namespace "default").
 done
 
 # 3) Auf erfolgreichen Rollout warten.
@@ -129,7 +151,7 @@ kubectl -n "$NAMESPACE" run "smoke-${RANDOM}" --rm -i --restart=Never --image=cu
 #                    aufzugeben.
 # Schlaegt der Aufruf trotzdem fehl, greift wieder rollback().
 
-echo "Deployment ${SHA} in '${NAMESPACE}' erfolgreich."
+echo "Deployment ${SHA} in '${NAMESPACE}' erfolgreich - erreichbar unter http://<VM-IP-oder-Hostname>:${NODEPORT}"
 # Wird nur erreicht, wenn keiner der vorherigen Schritte "rollback" ausgeloest
 # hat - im Actions-Log damit auf den ersten Blick erkennbar, dass wirklich
 # alles (inkl. Smoke-Test) durchgelaufen ist.

@@ -62,6 +62,30 @@ TIMEOUT="120s"
 # Wie lange maximal auf einen erfolgreichen Rollout gewartet wird, bevor
 # Schritt 3 unten als fehlgeschlagen gilt und der Rollback greift.
 
+diagnose() {
+  # Wird NUR beim Smoke-Test-Fehlschlag vor dem Rollback aufgerufen (siehe
+  # unten). Zweck: Nach einem rollback() sind Endpoints/Events wieder auf dem
+  # alten, funktionierenden Stand - der eigentliche Fehlerzustand waere ohne
+  # diesen Dump unwiederbringlich weg, sobald rollback() gelaufen ist. So
+  # landet der Cluster-Zustand IM MOMENT DES FEHLERS direkt im Actions-Log,
+  # auch wenn niemand parallel live mit kubectl draufschaut.
+  echo "::group::Diagnose vor Rollback (Namespace ${NAMESPACE})"
+  echo "--- kubectl get pods -o wide ---"
+  kubectl -n "$NAMESPACE" get pods -o wide || true
+  echo "--- kubectl get endpoints ---"
+  kubectl -n "$NAMESPACE" get endpoints || true
+  echo "--- kubectl get svc ---"
+  kubectl -n "$NAMESPACE" get svc -o wide || true
+  echo "--- letzte Events ---"
+  kubectl -n "$NAMESPACE" get events --sort-by=.lastTimestamp | tail -20 || true
+  echo "--- Logs frontend (letzte 30 Zeilen) ---"
+  kubectl -n "$NAMESPACE" logs -l app=frontend --tail=30 --all-containers || true
+  echo "::endgroup::"
+  # "|| true" an jeder Zeile: Ein fehlschlagender Diagnose-Befehl soll das
+  # Skript nicht zusaetzlich abbrechen (set -e) - die Diagnose ist ein reiner
+  # Best-Effort-Blick, kein kritischer Schritt.
+}
+
 rollback() {
   # Wird unten an zwei Stellen per "|| rollback" aufgerufen, sobald ein
   # Rollout-Wait oder der Smoke-Test fehlschlaegt.
@@ -121,9 +145,22 @@ for d in backend frontend; do
   # in diesem Fall greift ueber "||" sofort die rollback()-Funktion.
 done
 
+# 3b) Kurze Gnadenfrist, bevor der Smoke-Test startet.
+sleep 8
+# Auf dieser Single-Node-Lab-VM (Hyper-V) wurde beobachtet, dass unmittelbar
+# nach einem Rolling Update ("successfully rolled out") ein SOFORT danach
+# gestarteter, ebenfalls brandneuer Smoke-Test-Pod die frisch erzeugten
+# Service-Endpoints kurzzeitig nicht erreichen konnte (TCP-Connect blieb ohne
+# Antwort haengen, keine sofortige Ablehnung) - vermutlich weil kube-proxy/
+# das CNI (flannel) die Routing-/iptables-Regeln fuer die brandneuen Pod-IPs
+# noch nicht vollstaendig synchronisiert hatten. "rollout status" prueft nur
+# die Readiness-Probes der Pods selbst, nicht ob das Netzwerk-Routing dorthin
+# schon vollstaendig steht - dieser kurze Puffer gibt genau dafuer Zeit.
+
 # 4) Smoke-Test: Health-Endpoint ueber Frontend-Service -> nginx -> Backend.
 kubectl -n "$NAMESPACE" run "smoke-${RANDOM}" --rm -i --restart=Never --image=curlimages/curl:8.10.1 -- \
-  curl -fsS --retry 5 --retry-delay 2 --retry-connrefused http://frontend/api/health || rollback
+  curl -fsS --connect-timeout 5 --retry 8 --retry-delay 3 --retry-all-errors http://frontend/api/health \
+  || { diagnose; rollback; }
 # Selbst wenn Schritt 3 gruen ist (Pods sind "ready"), heisst das nur, dass
 # die Probes einzelner Container ok sind - dieser Schritt prueft zusaetzlich
 # den TATSAECHLICHEN Weg eines echten Requests durch den ganzen Stack:
@@ -145,11 +182,24 @@ kubectl -n "$NAMESPACE" run "smoke-${RANDOM}" --rm -i --restart=Never --image=cu
 #                    enden statt die Fehlerseite als "Erfolg" zu werten;
 #                    -s: keine Fortschrittsanzeige; -S: Fehlermeldungen trotz
 #                    -s dennoch ausgeben.
-#   --retry ...      nginx/Flask brauchen nach "ready" ggf. noch einen
-#                    Moment; bis zu 5 Versuche im 2s-Abstand federn kurze
-#                    Verzoegerungen ab, statt beim ersten Versuch sofort
-#                    aufzugeben.
-# Schlaegt der Aufruf trotzdem fehl, greift wieder rollback().
+#   --connect-timeout 5   Begrenzt JEDEN einzelnen Verbindungsversuch auf
+#                    5s. Ohne diese Grenze kann ein einzelner haengender
+#                    Connect-Versuch (siehe Kommentar bei "sleep 8" oben)
+#                    viele Sekunden dauern, bevor curl ueberhaupt zum
+#                    naechsten Retry kommt.
+#   --retry 8        Bis zu 8 weitere Versuche, macht zusammen mit
+#   --retry-delay 3  3s Pause dazwischen einen Gesamt-Zeitrahmen von grob
+#                    bis zu 8 * (5s + 3s) = 64s, um kurze Verzoegerungen
+#                    beim Netzwerk-Routing (nicht nur bei der App selbst)
+#                    abzufedern, statt beim ersten Versuch sofort aufzugeben.
+#   --retry-all-errors   Standardmaessig wiederholt curl nur bei bestimmten
+#                    Fehlerarten (z. B. Connection Refused). Der hier
+#                    beobachtete Fehler war aber ein haengender Connect ohne
+#                    Antwort (TCP-Timeout) - das faellt ohne dieses Flag NICHT
+#                    unter die Standard-Retry-Faelle, der Smoke-Test wuerde
+#                    sonst schon beim ersten Timeout endgueltig aufgeben.
+# Schlaegt der Aufruf trotzdem fehl: diagnose() sammelt den Cluster-Zustand
+# im Actions-Log (siehe oben), danach greift rollback().
 
 echo "Deployment ${SHA} in '${NAMESPACE}' erfolgreich - erreichbar unter http://<VM-IP-oder-Hostname>:${NODEPORT}"
 # Wird nur erreicht, wenn keiner der vorherigen Schritte "rollback" ausgeloest
